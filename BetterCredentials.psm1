@@ -8,6 +8,15 @@ if (!$ScriptRoot) {
 
 Add-Type -Path $ScriptRoot\CredentialManagement.cs
 
+$script:IsHelloCompatible = (
+    [environment]::OSVersion.Platform -eq 'Win32NT' -and 
+    [environment]::OSVersion.Version -ge [version]'10.0.17763.0' -and 
+    $PSVersionTable.PSVersion -ge '5.1.0'
+)
+if ( $script:IsHelloCompatible ) {
+    Add-Type -Path $ScriptRoot\WindowsHello.dll
+}
+
 ## Private Functions
 function DecodeSecureString {
     #.Synopsis
@@ -25,7 +34,7 @@ function DecodeSecureString {
             return ""
         }
         $BSTR = [System.Runtime.InteropServices.marshal]::SecureStringToBSTR($secure)
-        Write-Output [System.Runtime.InteropServices.marshal]::PtrToStringAuto($BSTR)
+        Write-Output ([System.Runtime.InteropServices.marshal]::PtrToStringAuto($BSTR))
         [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
     }
 }
@@ -249,6 +258,7 @@ function Get-Credential {
           Will prompt for credentials inline in the host instead of in a popup dialog
         .Notes
           History:
+           v 4.6 Add Windows Hello first implementation
            v 4.5 Add Find-Credential, Set-Credential, Remove-Credential
            v 4.4 Add a Test-Credential
            v 4.3 Update module metadata and copyrights, etc.
@@ -311,6 +321,11 @@ function Get-Credential {
         [Parameter(ParameterSetName = "Prompted", Mandatory = $false)]
         [switch]$Inline,
 
+        [Parameter(ParameterSetName = "Prompted", Mandatory = $false)]
+        [Parameter(ParameterSetName = "Promptless", Mandatory = $false)]
+        [Alias('Hello')]
+        [switch]$WindowsHello,
+        
         #  Store the credential in the file system (overwriting existing credentials)
         #  NOTE: These passwords are STORED ON DISK encrypted using Windows DPAPI
         #        They are encrypted, but anyone with ACCESS TO YOUR LOGIN ACCOUNT can decrypt them
@@ -333,7 +348,20 @@ function Get-Credential {
     )
     process {
         Write-Verbose ($PSBoundParameters | Out-String)
+        
+        if ($WindowsHello -and $script:IsHelloCompatible -eq $false) {
+            throw "Your system isn't compatible with HelloCompatible. Check Platform, OSVersion requirements"
+        }
+        
+        if ($script:IsHelloCompatible) {
+            $WinHelloProviderType = 'WindowsHello.WinHelloProvider' -as [type]
+            if ( $WinHelloProviderType::IsAvailable() ) {
+                $WinHelloProvider = $WinHelloProviderType::new($Title, [IntPtr]::Zero)
+            }
+        }
+        
         [Management.Automation.PSCredential]$Credential = $null
+        
         if ( $UserName -is [System.Management.Automation.PSCredential]) {
             $Credential = $UserName
         } elseif (!$Force -and $UserName -ne $null) {
@@ -342,13 +370,39 @@ function Get-Credential {
                 if ($Delete) {
                     [CredentialManagement.Store]::Delete("${Domain}\${UserName}")
                 } else {
-                    $Credential = [CredentialManagement.Store]::Load("${Domain}\${UserName}")
+                    try {
+                        $Credential = [CredentialManagement.Store]::Load("${Domain}\${UserName}")
+                    }
+                    catch {
+                        Write-Verbose "Loading UserName $UserName from CredentialManagement Store failed."
+                    }
+                    if ($Credential.Description -match "^WindowsHello:" -and $script:IsHelloCompatible) {
+                        if ( $WinHelloProviderType::IsAvailable() ) {
+                            $DecryptedData = $WinHelloProvider.PromptToDecrypt([System.Convert]::FromBase64String((DecodeSecureString $Credential.Password)))
+                            $Credential = New-Object System.Management.Automation.PSCredential $UserName, (EncodeSecureString ([System.Text.Encoding]::UTF8.GetString($DecryptedData)))
+                        } else {
+                            Write-Error "Windows Hello Provider isn't available."
+                        }
+                    }
                 }
             } else {
                 if ($Delete) {
                     [CredentialManagement.Store]::Delete($UserName)
                 } else {
-                    $Credential = [CredentialManagement.Store]::Load($UserName)
+                    try {
+                        $Credential = [CredentialManagement.Store]::Load($UserName)
+                    }
+                    catch {
+                        Write-Verbose "Loading UserName $UserName from CredentialManagement Store failed."
+                    }
+                    if ($Credential.Description -match "^WindowsHello:" -and $script:IsHelloCompatible) {
+                        if ( $WinHelloProviderType::IsAvailable() ) {
+                            $DecryptedData = $WinHelloProvider.PromptToDecrypt([System.Convert]::FromBase64String((DecodeSecureString $Credential.Password)))
+                            $Credential = New-Object System.Management.Automation.PSCredential $UserName, (EncodeSecureString ([System.Text.Encoding]::UTF8.GetString($DecryptedData)))
+                        } else {
+                            Write-Error "Windows Hello Provider isn't available."
+                        }
+                    }
                 }
             }
         }
@@ -415,10 +469,18 @@ function Get-Credential {
             }
         }
 
+
         if ($Store) {
-            if ($Description) {
-                Add-Member -InputObject $Credential -MemberType NoteProperty -Name Description -Value $Description
+            if ($WindowsHello) {
+                if ($WinHelloProviderType::IsAvailable()) {
+                    $EncryptedData = $WinHelloProvider.Encrypt([System.Text.Encoding]::UTF8.GetBytes((DecodeSecureString $Credential.Password)))
+                    $Credential = New-Object System.Management.Automation.PSCredential $UserName, (EncodeSecureString ([System.Convert]::ToBase64String($EncryptedData)))
+                    $Description = "WindowsHello:$Description"
+                } else {
+                    Write-Error "Windows Hello Provider isn't available."
+                }
             }
+            Add-Member -InputObject $Credential -MemberType NoteProperty -Name Description -Value $Description -Force
             [CredentialManagement.Store]::Save($Credential)
         }
 
